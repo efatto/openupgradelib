@@ -1,7 +1,15 @@
 # Copyright 2025 Hunki Enterprises BV
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
+import logging
+
+from psycopg2 import sql
+
 from .openupgrade import logged_query
+from .openupgrade import column_exists
 from .openupgrade_tools import table_exists
+
+logger = logging.getLogger("OpenUpgrade")
+logger.setLevel(logging.DEBUG)
 
 
 def convert_company_dependent(
@@ -81,3 +89,60 @@ def convert_company_dependent(
     )
     for company_id, value in env.cr.fetchall():
         env["ir.default"].set(model_name, field_name, value, company_id=company_id)
+
+
+def convert_column_to_company_dependent(env, model_name, field_name):
+    """Turn a plain stored column into a company dependent jsonb column.
+
+    Reusable helper for a field that becomes ``company_dependent=True`` in
+    17.0/18.0 without having lived in ``ir_property`` before (openupgradelib's
+    ``convert_to_company_dependent`` only handles the ``ir_property`` storage
+    removed in 17.0). Safe to run more than once: it does nothing if the
+    column is missing or already ``jsonb``.
+
+    :param env: Odoo environment
+    :param model_name: name of the model owning the field
+    :param field_name: name of the field/column to convert
+    """
+    cr = env.cr
+    table = env[model_name]._table
+    if not column_exists(cr, table, field_name):
+        # the column does not exist yet: Odoo will create it as jsonb
+        return
+    cr.execute(
+        """
+        SELECT data_type
+          FROM information_schema.columns
+         WHERE table_name = %s
+           AND column_name = %s
+        """,
+        (table, field_name),
+    )
+    if cr.fetchone()[0] == "jsonb":
+        # already company dependent, nothing to do
+        return
+    cr.execute("SELECT id FROM res_company ORDER BY id")
+    company_ids = [str(row[0]) for row in cr.fetchall()]
+    if not company_ids:
+        logger.warning(
+            "%s: no company found, cannot convert %s.%s to company dependent",
+            model_name,
+            table,
+            field_name,
+        )
+        return
+    pairs = sql.SQL(", ").join(
+        sql.SQL("{}, {}").format(sql.Literal(company_id), sql.Identifier(field_name))
+        for company_id in company_ids
+    )
+    logged_query(
+        cr,
+        sql.SQL(
+            "ALTER TABLE {table} ALTER COLUMN {column} TYPE jsonb "
+            "USING jsonb_build_object({pairs})"
+        ).format(
+            table=sql.Identifier(table),
+            column=sql.Identifier(field_name),
+            pairs=pairs,
+        ),
+    )
